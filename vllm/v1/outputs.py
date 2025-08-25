@@ -2,7 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, TYPE_CHECKING, Any
+from numpy.typing import NDArray
+from vllm.sequence import IntermediateTensors
+import enum
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 import torch
 
@@ -59,6 +65,37 @@ class LogprobsTensors(NamedTuple):
             selected_token_ranks=selected_token_ranks,
         )
 
+class ExecuteModelStage(enum.Enum):
+    PREPARE = enum.auto()
+    FINALIZE = enum.auto()
+
+@dataclass
+class PrepareOutput:
+
+    scheduler_output: "SchedulerOutput"
+    attn_metadata: Any
+    padded_num_tokens_across_dp: int
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    total_num_scheduled_tokens: int
+    num_reqs: int
+    sample_indices: torch.Tensor
+    cu_num_tokens: NDArray
+    num_scheduled_tokens: list[int]
+    inputs_embeds: Optional[torch.Tensor] = None
+    intermediate_tensors: Optional[IntermediateTensors] = None
+
+
+@dataclass
+class ForwardOutput:
+
+    hidden_states: torch.Tensor
+    sampler_output: Any
+    sampling_metadata: Any
+    discard_sampled_tokens_req_indices: list[int]
+    finished_sending: Optional[set[str]] = None
+    finished_recving: Optional[set[str]] = None
+    spec_decode_metadata: Optional[Any] = None
 
 @dataclass
 class SamplerOutput:
@@ -105,6 +142,22 @@ class ModelRunnerOutput:
     finished_sending: Optional[set[str]] = None
     finished_recving: Optional[set[str]] = None
 
+
+
+EMPTY_PREPARE_OUTPUT = PrepareOutput(
+            scheduler_output=None,
+            attn_metadata=None,
+            padded_num_tokens_across_dp=None,
+            input_ids=None,
+            positions=None,
+            total_num_scheduled_tokens=None,
+            num_reqs=None,
+            sample_indices=None,
+            inputs_embeds=None,
+            cu_num_tokens=None,
+            num_scheduled_tokens=None,
+            intermediate_tensors=None
+        )
 
 EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],
                                               req_id_to_index={},

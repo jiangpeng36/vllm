@@ -3,6 +3,7 @@
 import multiprocessing
 import os
 import pickle
+import queue
 import signal
 import sys
 import threading
@@ -17,6 +18,7 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from threading import Thread
 from typing import Any, Callable, Optional, Union, cast
+from vllm.v1.outputs import PrepareOutput, ForwardOutput, ExecuteModelStage
 
 import cloudpickle
 
@@ -160,6 +162,7 @@ class MultiprocExecutor(Executor):
         self,
         scheduler_output,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        # traceback.print_stack()
         (output, ) = self.collective_rpc("execute_model",
                                          args=(scheduler_output, ),
                                          unique_reply_rank=self.output_rank,
@@ -190,6 +193,7 @@ class MultiprocExecutor(Executor):
             else:
                 send_method = cloudpickle.dumps(
                     method, protocol=pickle.HIGHEST_PROTOCOL)
+            # traceback.print_stack()
             self.rpc_broadcast_mq.enqueue(
                 (send_method, args, kwargs, unique_reply_rank))
 
@@ -276,6 +280,8 @@ class MultiprocExecutor(Executor):
 
     @property
     def max_concurrent_batches(self) -> int:
+        if self.scheduler_config.async_scheduling:
+            return 2
         return self.parallel_config.pipeline_parallel_size
 
     def _get_output_rank(self) -> int:
@@ -438,6 +444,27 @@ class WorkerProc:
         destroy_model_parallel()
         destroy_distributed_environment()
 
+    def forward_busy_loop(self):
+        forward_func = getattr(self.worker, "run_forward")
+        while True:
+            prepare_output = self.forward_request_q.get()
+            # print("have forward")
+            forward_output = forward_func(prepare_output)
+            # print("done forward", forward_output)
+            self.forward_status_q.get()
+            self.forward_reponse_q.put(forward_output)
+
+    def start_forward_thread(self):
+        self.forward_request_q = queue.Queue[PrepareOutput](1)
+        self.forward_reponse_q = queue.Queue[ForwardOutput](1)
+        self.forward_status_q = queue.Queue[int](1)
+        self.forward_busy = 1
+        self.forward_thread = threading.Thread(
+            target=self.forward_busy_loop,
+            args=(),
+            daemon=True)
+        self.forward_thread.start()
+
     @staticmethod
     def worker_main(*args, **kwargs):
         """ Worker initialization and execution loops.
@@ -480,6 +507,7 @@ class WorkerProc:
             ready_writer.close()
             ready_writer = None
 
+            worker.start_forward_thread()
             worker.worker_busy_loop()
 
         except Exception:
@@ -511,15 +539,54 @@ class WorkerProc:
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
+        prep_count = 0
+        forward_out = None
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue()
+            # traceback.print_stack()
 
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
-                output = func(*args, **kwargs)
+
+                # output = func(*args, is_second, **kwargs)
+                if func.__name__ == "execute_model":
+                    output = func(*args, ExecuteModelStage.PREPARE, forward_out, **kwargs)
+                    post_func = getattr(self.worker, "post_process")
+                    # print("maby start prepare")
+                    prep_count += 1
+
+                    if isinstance(output, PrepareOutput):
+                        # Now output is type of PrepareOutput
+                        # print("after prepare:", output.scheduler_output)
+                        forward_idle = (self.forward_status_q.empty() and
+                            self.forward_reponse_q.empty())
+                        if not forward_idle:
+                            # 第二次forward起，执行该流程
+                            forward_out = self.forward_reponse_q.get()
+                            # print("get forward", forward_out)
+                            # print("after update:", output.scheduler_output)
+                            # if prep_count == 3:
+                            #     while True:
+                            #             time.sleep(100)
+                        output = func(*args, ExecuteModelStage.FINALIZE, forward_out, **kwargs)
+                        # print("after update:", output.scheduler_output)
+                        self.forward_request_q.put(output)
+                        self.forward_status_q.put(self.forward_busy)
+                        if forward_idle:
+                            # print("forward_continue", prep_count)
+                            continue
+                        post_output = post_func(output, forward_out, 1)
+                        # print("after post:", post_output)
+                        output = post_output
+                        # print("after post:", output)
+                        # if prep_count == 2:
+                        #     while True:
+                        #             time.sleep(100)
+                else:
+                    output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):

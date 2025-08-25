@@ -43,6 +43,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import EngineHandshakeMetadata, EngineZmqAddresses
 from vllm.version import __version__ as VLLM_VERSION
+import traceback
 
 logger = init_logger(__name__)
 
@@ -124,6 +125,7 @@ class EngineCore:
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
                                                      SchedulerOutput]]] = None
+        print("self.batch_queue_size", self.batch_queue_size)
         if self.batch_queue_size > 1:
             logger.info("Batch queue is enabled with size %d",
                         self.batch_queue_size)
@@ -228,6 +230,9 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        # scheduler_output1 = self.scheduler.schedule()
+        # print("scheduler_output:", scheduler_output)
+        # print("scheduler_output1:", scheduler_output1)
         model_output = self.execute_model(scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
@@ -260,6 +265,7 @@ class EngineCore:
         if not self.batch_queue.full():
             scheduler_output = self.scheduler.schedule()
             if scheduler_output.total_num_scheduled_tokens > 0:
+                print("batch_queue", self.batch_queue.unfinished_tasks, scheduler_output)
                 future = self.model_executor.execute_model(scheduler_output)
                 self.batch_queue.put_nowait(
                     (future, scheduler_output))  # type: ignore
@@ -526,6 +532,7 @@ class EngineCoreProc(EngineCore):
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        # traceback.print_stack()
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
@@ -560,6 +567,7 @@ class EngineCoreProc(EngineCore):
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
         for output in (outputs.items() if outputs else ()):
+            # print("engine output", type(output), output)
             self.output_queue.put_nowait(output)
 
         return model_executed
