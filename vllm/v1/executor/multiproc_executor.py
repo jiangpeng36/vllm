@@ -3,6 +3,7 @@
 import multiprocessing
 import os
 import pickle
+import queue
 import signal
 import threading
 import time
@@ -16,6 +17,7 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from threading import Thread
 from typing import Any, Callable, Optional, Union, cast
+from vllm.v1.core.sched.output import GrammarBitmask
 
 import cloudpickle
 
@@ -512,6 +514,28 @@ class WorkerProc:
         destroy_model_parallel()
         destroy_distributed_environment()
 
+    def forward_busy_loop(self):
+        sample_func = getattr(self.worker, "sample")
+        while True:
+            rank, bitmask = self.sample_request_q.get()
+            # print("have forward")
+            model_output = sample_func(bitmask)
+            # print("done forward", model_output)
+            self.forward_status_q.get()
+            self.forward_reponse_q.put((rank, model_output))
+
+    def start_forward_thread(self):
+        self.forward_request_q = queue.Queue[int](1)
+        self.forward_reponse_q = queue.Queue[(int, ModelRunnerOutput)](1)
+        self.forward_status_q = queue.Queue[int](1)
+        self.forward_busy = 1
+        self.sample_request_q = queue.Queue[(int, GrammarBitmask)](1)
+        self.forward_thread = threading.Thread(
+            target=self.forward_busy_loop,
+            args=(),
+            daemon=True)
+        self.forward_thread.start()
+
     @staticmethod
     def worker_main(*args, **kwargs):
         """ Worker initialization and execution loops.
@@ -576,6 +600,7 @@ class WorkerProc:
             ready_writer.close()
             ready_writer = None
 
+            worker.start_forward_thread()
             worker.worker_busy_loop()
 
         except Exception:
@@ -617,7 +642,23 @@ class WorkerProc:
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
-                output = func(*args, **kwargs)
+                if func.__name__ == "sample":
+                    self.sample_request_q.put((output_rank, *args))
+                    self.forward_status_q.put(self.forward_busy)
+                    # output = None
+                    continue
+                elif func.__name__ == "execute_model":
+                    output = func(*args, **kwargs)
+                    forward_idle = (self.forward_status_q.empty() and
+                            self.forward_reponse_q.empty())
+                    if not forward_idle:
+                        sample_rank, model_output = self.forward_reponse_q.get()
+                        if sample_rank is None or self.rank == sample_rank:
+                            self.worker_response_mq.enqueue(
+                                (WorkerProc.ResponseStatus.SUCCESS, model_output))
+                    # output = func(*args, **kwargs)
+                else:
+                    output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):

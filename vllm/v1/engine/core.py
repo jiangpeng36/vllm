@@ -48,6 +48,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
+import threading
 
 logger = init_logger(__name__)
 
@@ -560,11 +561,14 @@ class EngineCoreProc(EngineCore):
 
         if self.batch_queue is None:
             if self.vllm_config.scheduler_config.async_scheduling:
+                print("async_scheduling0")
                 self.step_fn = self.step_async
                 self.inflight_batch = False
             else:
+                print("async_scheduling1")
                 self.step_fn = self.step
         else:
+            print("async_scheduling2")
             self.step_fn = self.step_with_batch_queue
 
     @contextmanager
