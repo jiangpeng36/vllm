@@ -605,7 +605,14 @@ class WorkerProc:
         """Entrypoint for the thread which handles outputs asynchronously."""
         while True:
             output = self.async_output_queue.get()
-            self.enqueue_worker_output(output)
+            if isinstance(output, AsyncModelRunnerOutput):
+                output = output.get_output()
+
+            if isinstance(output, Exception):
+                result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            else:
+                result = (WorkerProc.ResponseStatus.SUCCESS, output)
+            self.worker_response_mq.enqueue(result)
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
@@ -626,8 +633,7 @@ class WorkerProc:
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
-                    self.worker_response_mq.enqueue(
-                        (WorkerProc.ResponseStatus.FAILURE, str(e)))
+                    self.async_output_queue.put(e)
                 continue
 
             if output_rank is None or self.rank == output_rank:
